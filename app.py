@@ -1,632 +1,285 @@
-import streamlit as st
-import pandas as pd
 import numpy as np
-import numpy_financial as npf
-import openpyxl
-import requests
-import io
-from io import BytesIO
-from datetime import datetime
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from streamlit_gsheets import GSheetsConnection
 
-st.set_page_config(page_title="DCF Project Calculator", layout="wide", page_icon="📊")
+st.set_page_config(page_title="Dashboard de Ventas", page_icon="📊", layout="wide")
 
-# ===== MÁRGENES / PADDING DE LA APP (edita estos valores) =====
-PAGE_MAX_WIDTH    = "90vw"   # ancho máximo del contenido (acepta vw, px, %, etc.)
-PAGE_PADDING_TOP  = "1.5rem" # espacio arriba, antes del título
-PAGE_PADDING_LEFT  = "1rem"  # margen izquierdo del contenido
-PAGE_PADDING_RIGHT = "1rem"  # margen derecho del contenido
-
-# ===== ANCHO DE ETIQUETAS DE TÍTULO =====
-# Las tablas ocupan el 100% del ancho disponible (use_container_width), así que
-# los títulos usan el mismo 100% para quedar alineados con ellas.
-SECTION_HDR_WIDTH  = "100%"  # ancho de los títulos de sección (INFLOWS, OUTFLOWS, TOTALES, etc.)
-SUBGROUP_HDR_WIDTH = "100%"  # ancho de las etiquetas de subgrupo (REVENUE, COSTS & EXPENSES, etc.)
-
-st.markdown(f"""
-<style>
-section[data-testid="stSidebar"] {{ display: none; }}
-.main .block-container {{
-    padding-top: {PAGE_PADDING_TOP};
-    max-width: {PAGE_MAX_WIDTH} !important;
-    margin-left: auto !important;
-    margin-right: auto !important;
-    padding-left: {PAGE_PADDING_LEFT};
-    padding-right: {PAGE_PADDING_RIGHT};
-}}
-.kpi-card {{
-    background: #ffffff; border-radius: 10px; padding: 14px 10px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.10); text-align: center;
-    margin-bottom: 12px; min-height: 110px;
-    display: flex; flex-direction: column; justify-content: center; align-items: center;
-}}
-.kpi-label {{ font-size: 10px; font-weight: 700; color: #666; text-transform: uppercase; letter-spacing: 0.5px; line-height: 1.4; }}
-.kpi-val   {{ font-size: 20px; font-weight: 900; color: #0052FF; margin: 6px 0 3px; }}
-.kpi-sub   {{ font-size: 10px; color: #999; }}
-.kpi-val-green {{ font-size: 20px; font-weight: 900; color: #00875A; margin: 6px 0 3px; }}
-.section-hdr {{
-    font-size: 13px; font-weight: 800; color: #0052FF;
-    letter-spacing: 2px; text-transform: uppercase;
-    border-left: 4px solid #0052FF; padding-left: 10px; margin: 20px 0 6px;
-    width: {SECTION_HDR_WIDTH}; box-sizing: border-box;
-}}
-.subgroup-hdr {{
-    background: #F5F0C8; padding: 5px 12px 5px 16px;
-    font-size: 11px; font-weight: 800; letter-spacing: 1.2px;
-    color: #5D4E0D; border-left: 4px solid #C8A800;
-    margin: 6px 0 1px 0;
-    width: {SUBGROUP_HDR_WIDTH}; box-sizing: border-box;
-}}
-.page-title {{ font-size: 26px; font-weight: 900; color: #0052FF; letter-spacing: 1px; }}
-.page-sub   {{ font-size: 13px; color: #888; margin-top: -4px; }}
-</style>
-""", unsafe_allow_html=True)
-
-# ===== ANCHOS DE TABLAS (edita estos valores) =====
-TABLES_USE_FIXED_WIDTH = False   # True = usar anchos fijos definidos abajo, False = ocupar todo el ancho disponible
-CONCEPT_COL_WIDTH = 220         # ancho columna "Concepto" en px (tablas INFLOWS/OUTFLOWS/FINANCING/TOTALES/FCF)
-YEAR_COL_WIDTH    = 100         # ancho de cada columna de año y SUBTOTAL en px (mismas tablas)
-
-st.markdown("""
-<style>
-div[data-testid="stDataFrame"],
-div[data-testid="stDataFrame"] > div,
-.stDataFrameGlideDataEditor {
-    width: 100% !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
-@st.cache_data(ttl=300)
-def _download_xlsx():
-    FILE_ID = st.secrets["FILE_ID"]
-    r = requests.get(f"https://docs.google.com/spreadsheets/d/{FILE_ID}/export?format=xlsx")
-    return r.content
-
-@st.cache_data
-def get_projects():
-    wb = openpyxl.load_workbook(io.BytesIO(_download_xlsx()), read_only=True)
-    return [s for s in wb.sheetnames if s not in ("INSTRUCCIONES", "PLANTILLA")]
-
-@st.cache_data
-def load_defaults(project_name: str):
-    wb = openpyxl.load_workbook(io.BytesIO(_download_xlsx()), data_only=True)
-    ws = wb[project_name]
-
-    header = next(ws.iter_rows(min_row=2, max_row=2, values_only=True))
-    years = []
-    for v in header[2:]:
-        try:
-            y = int(v)
-            if 1900 < y < 2200:
-                years.append(y)
-        except (TypeError, ValueError):
-            pass
-    years = years[:10]  # limitar a un horizonte de 10 años
-    n = len(years)
-
-    KNOWN = {"INFLOWS", "OUTFLOWS", "FINANCING"}
-    sections = {"INFLOWS": [], "OUTFLOWS": [], "FINANCING": []}
-    current = None
-
-    def _f(v):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return 0.0
-
-    for row in ws.iter_rows(min_row=3, max_row=39, values_only=True):
-        sec     = str(row[0]).strip() if row[0] else ""
-        concept = str(row[1]).strip() if row[1] else ""
-
-        if sec in KNOWN:
-            current = sec
-            if concept:
-                vals = [_f(v) for v in row[2:2 + n]]
-                sections[current].append((concept, vals))
-            continue
-
-        if current and concept:
-            vals = [_f(v) for v in row[2:2 + n]]
-            sections[current].append((concept, vals))
-
-    DEFAULTS = {
-        "INFLOWS":   ["Revenue 1", "Revenue 2"],
-        "OUTFLOWS":  ["CAPEX", "OPEX", "Comm 1", "Comm 2"],
-        "FINANCING": ["Debt Draw", "Debt Repay"],
+st.markdown(
+    """
+    <style>
+    .stTabs [data-baseweb="tab-list"] button[aria-selected="true"] {
+        background-color: #cde2fb;
+        border-radius: 6px 6px 0 0;
     }
-
-    for sec, default_concepts in DEFAULTS.items():
-        loaded = {r[0]: r[1] for r in sections[sec]}
-        ordered = []
-        for c in default_concepts:
-            ordered.append((c, loaded.get(c, [0.0] * n)))
-        for c, v in sections[sec]:
-            if c not in default_concepts:
-                ordered.append((c, v))
-        sections[sec] = ordered
-
-    # Leer métricas desde fila 40 en adelante (col A = label, col B = valor)
-    metrics = []
-    reading = False
-    for row in ws.iter_rows(min_row=40, max_col=2, values_only=True):
-        a, b = row[0], row[1]
-        if str(a).strip().lower() == "description":
-            reading = True
-            continue
-        if reading and a and b is not None:
-            try:
-                metrics.append((str(a).strip(), float(b)))
-            except (TypeError, ValueError):
-                pass
-
-    return sections, years, metrics
-
-def fmt_usd(v):
-    if v is None or (isinstance(v, float) and np.isnan(v)):
-        return "—"
-    return f"(${abs(v):,.0f})" if v < 0 else f"${v:,.0f}"
-
-def _pdf_safe(s):
-    # Helvetica (fuente core del PDF) solo soporta Latin-1; cualquier
-    # carácter fuera de ese rango (tipografía "inteligente" pegada desde
-    # Word/Excel, emojis, etc.) hace que fpdf lance una excepción y la
-    # descarga falle en silencio. Lo sustituimos en vez de reventar.
-    return str(s).encode("latin-1", "replace").decode("latin-1")
-
-# Sub-group visual grouping (purely display — data structure unchanged)
-CONCEPT_SUBGROUP = {
-    "Revenue 1":  "REVENUE",
-    "Revenue 2":  "REVENUE",
-    "CAPEX":      "COSTS & EXPENSES",
-    "OPEX":       "COSTS & EXPENSES",
-    "Comm 1":     "COMMISSIONS",
-    "Comm 2":     "COMMISSIONS",
-}
-SEC_SUBGROUPS = {
-    "INFLOWS":   ["REVENUE"],
-    "OUTFLOWS":  ["COSTS & EXPENSES", "COMMISSIONS", "TAXES"],
-    "FINANCING": ["FCF FROM FINANCING"],
-}
-SEC_DEFAULT_SG = {
-    "INFLOWS":   "REVENUE",
-    "OUTFLOWS":  "TAXES",
-    "FINANCING": "FCF FROM FINANCING",
-}
-
-def kpi_card(label, value, sub="", green=False):
-    cls = "kpi-val-green" if green else "kpi-val"
-    return (f'<div class="kpi-card"><div class="kpi-label">{label}</div>'
-            f'<div class="{cls}">{value}</div><div class="kpi-sub">{sub}</div></div>')
-
-# Ancho de columna para "Concepto" y para columnas numéricas (años / SUBTOTAL)
-_CONCEPT_W = CONCEPT_COL_WIDTH if TABLES_USE_FIXED_WIDTH else "medium"
-_YEAR_W    = YEAR_COL_WIDTH if TABLES_USE_FIXED_WIDTH else "small"
-TABLES_USE_CONTAINER_WIDTH = not TABLES_USE_FIXED_WIDTH
-
-def col_cfg(scols):
-    cfg = {"Concepto": st.column_config.TextColumn("Concepto", width=_CONCEPT_W, pinned=True)}
-    cfg.update({
-        y: st.column_config.NumberColumn(f"Año {i + 1}", format="$%,.0f", width=_YEAR_W)
-        for i, y in enumerate(scols)
-    })
-    cfg["SUBTOTAL"] = st.column_config.NumberColumn("SUBTOTAL", format="$%,.0f", width=_YEAR_W)
-    return cfg
-
-def total_row_style(df, num_cols):
-    return df.style.apply(
-        lambda r: ["background-color:#1E3A5F;color:white;font-weight:bold"] * len(r), axis=1
-    ).format(lambda x: "-" if x == 0 else (f"({abs(x):,.0f})" if x < 0 else f"${x:,.0f}"), subset=num_cols)
-
-def sum_by_year(section, n):
-    return [sum(vals[i] for _, vals in section) for i in range(n)]
-
-def render_fcf_row(label, year_vals, subtotal, scols):
-    row = {"Concepto": label}
-    row.update({scols[i]: year_vals[i] for i in range(len(scols))})
-    row["SUBTOTAL"] = subtotal
-    df = pd.DataFrame([row])
-    st.dataframe(
-        df.style.apply(
-            lambda r: ["background-color:#DBEAFE;color:#1E3A5F;font-weight:bold"] * len(r), axis=1
-        ).format(
-            lambda x: f"({abs(x):,.0f})" if x < 0 else f"${x:,.0f}",
-            subset=scols + ["SUBTOTAL"],
-        ),
-        use_container_width=TABLES_USE_CONTAINER_WIDTH,
-        hide_index=True,
-        column_config=col_cfg(scols),
-    )
-
-def render_section(title, key, section_data, scols, selected):
-    st.markdown(f'<div class="section-hdr">{title}</div>', unsafe_allow_html=True)
-
-    # Assign each concept to its sub-group
-    sg_data = {}
-    for concept, vals in section_data:
-        sg = CONCEPT_SUBGROUP.get(concept, SEC_DEFAULT_SG.get(key, "OTHER"))
-        sg_data.setdefault(sg, []).append((concept, vals))
-
-    subgroups  = SEC_SUBGROUPS.get(key, ["OTHER"])
-    all_results = []
-
-    for sg in subgroups:
-        sg_concepts = sg_data.get(sg, [])
-        if not sg_concepts:
-            continue
-
-        st.markdown(f'<div class="subgroup-hdr">{sg}</div>', unsafe_allow_html=True)
-
-        n_rows   = len(sg_concepts)
-        vals_key = f"vals_{key}_{sg}_{selected}"
-
-        if vals_key not in st.session_state or len(st.session_state[vals_key]) != n_rows:
-            st.session_state[vals_key] = [list(c[1]) for c in sg_concepts]
-
-        labels     = [c[0] for c in sg_concepts]
-        row_totals = [sum(v) for v in st.session_state[vals_key]]
-
-        df = pd.DataFrame(st.session_state[vals_key], columns=scols)
-        df.insert(0, "Concepto", labels)
-        df["SUBTOTAL"] = row_totals
-
-        edited = st.data_editor(
-            df,
-            use_container_width=TABLES_USE_CONTAINER_WIDTH,
-            num_rows="fixed",
-            key=f"editor_{key}_{sg}_{selected}",
-            disabled=["SUBTOTAL"],
-            column_config=col_cfg(scols),
-            hide_index=True,
-        )
-
-        edited[scols] = edited[scols].fillna(0).astype(float)
-
-        sg_results    = []
-        new_vals_list = []
-        for i in range(len(edited)):
-            concept = str(edited.iloc[i]["Concepto"] or sg_concepts[i][0])
-            vals    = edited.iloc[i][scols].tolist()
-            sg_results.append((concept, vals))
-            new_vals_list.append(vals)
-
-        if new_vals_list != st.session_state[vals_key]:
-            st.session_state[vals_key] = new_vals_list
-            st.rerun()
-
-        # Consolidated total row for this sub-group
-        sg_year_totals = edited[scols].sum()
-        sg_total       = sg_year_totals.sum()
-        total_row = pd.DataFrame([{
-            "Concepto": f"▶ {sg}",
-            **sg_year_totals.to_dict(),
-            "SUBTOTAL": sg_total,
-        }])
-        st.dataframe(
-            total_row_style(total_row, list(scols) + ["SUBTOTAL"]),
-            use_container_width=TABLES_USE_CONTAINER_WIDTH,
-            hide_index=True,
-            column_config=col_cfg(scols),
-        )
-
-        all_results.extend(sg_results)
-
-    return all_results
-
-st.markdown('<div class="page-title">📊 DCF PROJECT CALCULATOR</div>', unsafe_allow_html=True)
-st.markdown('<div class="page-sub">Selecciona un proyecto · edita las celdas · los resultados se recalculan automáticamente</div>', unsafe_allow_html=True)
-
-projects = get_projects()
-col_sel, col_info = st.columns([2, 5])
-with col_sel:
-    selected = st.selectbox("Proyecto", projects, key="project_selector")
-with col_info:
-    st.markdown(f"<br><span style='color:#888;font-size:13px'>Fuente: <code>Google Sheets</code> · Hoja: <code>{selected}</code></span>",
-                unsafe_allow_html=True)
-
-D, YEARS, METRICS = load_defaults(selected)
-SCOLS = [str(y) for y in YEARS]
-N = len(YEARS)
-st.divider()
-
-metrics_container = st.container()
-st.divider()
-
-inflows  = render_section("INFLOWS",  "INFLOWS",  D["INFLOWS"],  SCOLS, selected)
-outflows = render_section("OUTFLOWS", "OUTFLOWS", D["OUTFLOWS"], SCOLS, selected)
-
-inflows_yr  = sum_by_year(inflows, N)
-outflows_yr = sum_by_year(outflows, N)
-fcf_no_fin  = [inflows_yr[i] + outflows_yr[i] for i in range(N)]
-npv_no      = sum(fcf_no_fin)
-
-# Totales consolidados INFLOWS / OUTFLOWS
-st.markdown('<div class="section-hdr">TOTALES</div>', unsafe_allow_html=True)
-totals_df = pd.DataFrame([
-    {"Concepto": "▶ TOTAL INFLOWS",  **{SCOLS[i]: inflows_yr[i]  for i in range(N)}, "SUBTOTAL": sum(inflows_yr)},
-    {"Concepto": "▶ TOTAL OUTFLOWS", **{SCOLS[i]: outflows_yr[i] for i in range(N)}, "SUBTOTAL": sum(outflows_yr)},
-])
-st.dataframe(
-    totals_df.style.apply(
-        lambda r: [
-            "background-color:#DBEAFE;color:#1e40af;font-weight:bold" if r["Concepto"].endswith("INFLOWS")
-            else "background-color:#FEE2E2;color:#991b1b;font-weight:bold"
-        ] * len(r), axis=1
-    ).format(
-        lambda x: "-" if x == 0 else (f"({abs(x):,.0f})" if x < 0 else f"${x:,.0f}"),
-        subset=SCOLS + ["SUBTOTAL"],
-    ),
-    use_container_width=TABLES_USE_CONTAINER_WIDTH,
-    hide_index=True,
-    column_config=col_cfg(SCOLS),
+    .stTabs [data-baseweb="tab-list"] button[aria-selected="true"] p {
+        color: #184f95;
+        font-weight: 600;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
-st.markdown('<div class="section-hdr">FCF SIN FINANCIAMIENTO</div>', unsafe_allow_html=True)
-render_fcf_row("FCF (Excluye Financiamiento)", fcf_no_fin, npv_no, SCOLS)
+# --- Paleta (fija, validada para accesibilidad — ver skill dataviz) ---
+CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+GOOD, CRITICAL, MUTED = "#0ca30c", "#d03b3b", "#898781"
+INK, GRID, BASELINE = "#0b0b0b", "#e1e0d9", "#c3c2b7"
+FONT = dict(family="system-ui, -apple-system, Segoe UI, sans-serif", color=INK, size=13)
 
-financing    = render_section("FINANCING", "FINANCING", D["FINANCING"], SCOLS, selected)
-financing_yr = sum_by_year(financing, N)
-fcf_with_fin = [fcf_no_fin[i] + financing_yr[i] for i in range(N)]
-npv_fin      = sum(fcf_with_fin)
+REGION_ORDER = ["Chiriqui", "Colon", "Panama Este", "Panama Oeste"]
+REGION_COLORS = {r: CATEGORICAL[i] for i, r in enumerate(REGION_ORDER)}
 
-st.markdown('<div class="section-hdr">FCF CON FINANCIAMIENTO</div>', unsafe_allow_html=True)
-render_fcf_row("FCF (Incluye Financiamiento)", fcf_with_fin, npv_fin, SCOLS)
 
-def safe_irr(cf):
-    try:
-        v = npf.irr(cf)
-        if v is None:
-            return None
-        v = float(np.real(v))
-        return v if not np.isnan(v) else None
-    except Exception:
-        return None
-
-irr_no  = safe_irr(fcf_no_fin)
-irr_fin = safe_irr(fcf_with_fin)
-
-noi_last   = inflows_yr[-1] + outflows_yr[-1]
-sales_last = inflows_yr[-1]
-cap_rate   = noi_last / sales_last if sales_last != 0 else 0
-
-equity_actual = sum(-fcf_with_fin[i] for i in range(N) if fcf_with_fin[i] < 0)
-cash_on_cash  = npv_fin / equity_actual if equity_actual != 0 else None
-
-with metrics_container:
-    st.markdown('<div class="section-hdr">INVESTMENT RETURNS — Métricas Clave</div>', unsafe_allow_html=True)
-
-    def concept_total(section, name):
-        for concept, vals in section:
-            if concept == name:
-                return sum(vals)
-        return 0
-
-    PCT_KEYS  = {"CASH-ON-CASH", "IRR WITH FINANCING", "IRR SIN FINANCING",
-                 "ROI", "ROE", "CAP RATE", "CAP RATE ANUAL"}
-    MULT_KEYS = {"EQUITY MULTIPLE"}
-
-    def fmt_metric(key, val):
-        k = key.upper()
-        # Comparar por palabra completa, no por subcadena: "RATE" no debe
-        # coincidir dentro de "GENERATED", ni "CASH" dentro de "NET CASH GENERATED".
-        words = k.replace("-", " ").split()
-        if k in PCT_KEYS or "CASH-ON-CASH" in k or any(w in ("IRR", "RATE", "ROI", "ROE") for w in words):
-            return f"{val*100:.2f}%"
-        if k in MULT_KEYS or "MULTIPLE" in words:
-            return f"{val:.3f}"
-        return fmt_usd(val)
-
-    rows = [(label, fmt_metric(label, val)) for label, val in METRICS]
-
-    body = "".join(
-        f'<tr style="background:{"#FAFAFA" if i%2==0 else "#FFFFFF"}">'
-        f'<td style="padding:7px 14px;font-size:12px;font-weight:700;color:#1a1a2e;border-bottom:1px solid #eee">{d}</td>'
-        f'<td style="padding:7px 14px;text-align:right;font-size:12px;font-weight:700;color:#0052FF;border-bottom:1px solid #eee">{v}</td>'
-        f'</tr>'
-        for i, (d, v) in enumerate(rows)
+def style_fig(fig, height=380, show_legend=True):
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=FONT,
+        height=height,
+        margin=dict(l=10, r=10, t=40, b=10),
+        showlegend=show_legend,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0, title=None),
     )
+    fig.update_xaxes(showgrid=False, linecolor=BASELINE, ticks="outside", tickcolor=BASELINE, title=None)
+    fig.update_yaxes(showgrid=True, gridcolor=GRID, zeroline=False)
+    return fig
 
-    col_table, col_irr, col_van = st.columns([2, 1, 1])
-    with col_table:
-        st.markdown(f"""
-        <table style="width:100%;border-collapse:collapse;font-family:sans-serif;border:1px solid #ddd;overflow:hidden;margin-bottom:16px">
-          <thead>
-            <tr style="background:#F5F0C8">
-              <th style="padding:10px 14px;text-align:left;font-size:11px;font-weight:800;letter-spacing:1.5px;color:#333;border-bottom:2px solid #ccc">DESCRIPTION</th>
-              <th style="padding:10px 14px;text-align:right;font-size:11px;font-weight:800;letter-spacing:1.5px;color:#333;border-bottom:2px solid #ccc">PROJECT CLOSING OPERATOR</th>
-            </tr>
-          </thead>
-          <tbody>{body}</tbody>
-        </table>
-        """, unsafe_allow_html=True)
-    with col_irr:
-        irr_label = f"{irr_fin*100:.2f}%" if irr_fin is not None else "—"
-        st.markdown(kpi_card("IRR", irr_label, "Con financiamiento"), unsafe_allow_html=True)
-    with col_van:
-        st.markdown(kpi_card("VAN", fmt_usd(npv_fin), "Con financiamiento", green=True), unsafe_allow_html=True)
+
+conn = st.connection("gsheets", type=GSheetsConnection)
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando datos desde Google Sheets...")
+def load_data():
+    ventas = conn.read(worksheet="Ventas").dropna(subset=["ID_Venta"])
+    productos = conn.read(worksheet="Productos").dropna(subset=["ID_Producto"])
+    clientes = conn.read(worksheet="Clientes").dropna(subset=["ID_Cliente"])
+    presupuesto = conn.read(worksheet="Presupuesto").dropna(subset=["Region"])
+
+    ventas["Fecha"] = pd.to_datetime(ventas["Fecha"])
+    presupuesto["Fecha"] = pd.to_datetime(presupuesto["Fecha"])
+    clientes["Fecha_Primera_Compra"] = pd.to_datetime(clientes["Fecha_Primera_Compra"])
+
+    ventas["Monto_Venta"] = ventas["Cantidad"] * ventas["Precio_Unitario"]
+    ventas = ventas.merge(productos, on="ID_Producto", how="left")
+    ventas = ventas.merge(clientes, on="ID_Cliente", how="left")
+
+    return ventas, productos, clientes, presupuesto
+
+
+try:
+    ventas, productos, clientes, presupuesto = load_data()
+except Exception as e:
+    st.error(
+        "No se pudo conectar a Google Sheets. Verifica que `.streamlit/secrets.toml` exista y tenga "
+        "las credenciales de la cuenta de servicio (ver `.streamlit/secrets.toml.example` y el README)."
+    )
+    st.exception(e)
+    st.stop()
+
+# ----------------------------- Sidebar: filtros -----------------------------
+st.sidebar.header("Filtros")
+if st.sidebar.button("🔄 Recargar datos de Google Sheets"):
+    st.cache_data.clear()
+    st.rerun()
+
+min_date, max_date = ventas["Fecha"].min().date(), ventas["Fecha"].max().date()
+date_range = st.sidebar.date_input(
+    "Rango de fechas", value=(min_date, max_date), min_value=min_date, max_value=max_date
+)
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
+else:
+    start, end = pd.to_datetime(min_date), pd.to_datetime(max_date)
+
+regiones = st.sidebar.multiselect("Región", REGION_ORDER, default=REGION_ORDER)
+categorias = st.sidebar.multiselect(
+    "Categoría", sorted(productos["Categoria"].unique()), default=sorted(productos["Categoria"].unique())
+)
+vendedores = st.sidebar.multiselect(
+    "Vendedor", sorted(ventas["Vendedor"].unique()), default=sorted(ventas["Vendedor"].unique())
+)
+
+df = ventas[
+    (ventas["Fecha"] >= start)
+    & (ventas["Fecha"] <= end)
+    & (ventas["Region"].isin(regiones))
+    & (ventas["Categoria"].isin(categorias))
+    & (ventas["Vendedor"].isin(vendedores))
+].copy()
+
+st.title("📊 Dashboard de Ventas — Panel Solar (Panamá)")
+st.caption(f"Datos del {min_date} al {max_date}. Fuente: Google Sheets (actualiza cada 10 min o usa el botón de recarga).")
+
+if df.empty:
+    st.warning("No hay datos para los filtros seleccionados.")
+    st.stop()
+
+# ----------------------------------- KPIs -----------------------------------
+ventas_totales = df["Monto_Venta"].sum()
+num_transacciones = df["ID_Venta"].nunique()
+ticket_promedio = ventas_totales / num_transacciones if num_transacciones else 0
+clientes_distintos = df["ID_Cliente"].nunique()
+
+presu_filtrado = presupuesto[
+    (presupuesto["Fecha"] >= start.replace(day=1)) & (presupuesto["Fecha"] <= end) & (presupuesto["Region"].isin(regiones))
+]
+presupuesto_total = presu_filtrado["Presupuesto"].sum()
+cumplimiento = ventas_totales / presupuesto_total if presupuesto_total else 0
+
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Ventas Totales", f"${ventas_totales:,.0f}")
+c2.metric("# Transacciones", f"{num_transacciones:,}")
+c3.metric("Ticket Promedio", f"${ticket_promedio:,.0f}")
+c4.metric("Clientes Distintos", f"{clientes_distintos:,}")
+c5.metric("Cumplimiento Presupuesto", f"{cumplimiento:.0%}")
 
 st.divider()
-st.markdown('<div class="section-hdr">DESCARGAR REPORTE</div>', unsafe_allow_html=True)
-fmt_choice = st.radio("Selecciona el formato:", ["Excel (.xlsx)", "PDF (.pdf)"], horizontal=True)
 
-def build_excel():
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        wb_out   = writer.book
-        hdr_fmt  = wb_out.add_format({"bold": True, "bg_color": "#0052FF", "font_color": "#FFFFFF", "border": 1, "align": "center"})
-        lbl_fmt  = wb_out.add_format({"bold": True, "bg_color": "#EEF2FF", "border": 1, "indent": 1})
-        num_fmt  = wb_out.add_format({"num_format": '#,##0;(#,##0)', "border": 1, "align": "right"})
-        tot_fmt  = wb_out.add_format({"bold": True, "num_format": '#,##0;(#,##0)', "border": 1, "bg_color": "#DBEAFE", "align": "right"})
-        pct_fmt  = wb_out.add_format({"num_format": '0.00%', "border": 1, "align": "right"})
-        title_fmt = wb_out.add_format({"bold": True, "font_size": 14, "font_color": "#0052FF"})
-        sub_fmt  = wb_out.add_format({"bold": True, "bg_color": "#1E3A5F", "font_color": "#FFFFFF", "border": 1, "indent": 1})
-        date_fmt = wb_out.add_format({"italic": True, "font_size": 10, "font_color": "#888888"})
+tab_resumen, tab_presupuesto, tab_clientes, tab_productos, tab_vendedores = st.tabs(
+    ["Resumen", "Presupuesto", "Clientes", "Productos", "Vendedores"]
+)
 
-        ws = wb_out.add_worksheet("DCF PROJECT")
-        writer.sheets["DCF PROJECT"] = ws
-        ws.set_column(0, 0, 32)
-        for c in range(1, N + 3):
-            ws.set_column(c, c, 14)
+# --------------------------------- Resumen -----------------------------------
+with tab_resumen:
+    monthly = df.groupby(df["Fecha"].dt.to_period("M"))["Monto_Venta"].sum().reset_index()
+    monthly["Periodo"] = monthly["Fecha"]
+    monthly["AnioMesStr"] = monthly["Periodo"].astype(str)
+    monthly = monthly.sort_values("Periodo")
 
-        ncols = N + 1
-        ts = datetime.now().strftime("%d/%m/%Y  %H:%M")
-        ws.merge_range(0, 0, 0, ncols, f"Generado: {ts}", date_fmt)
-        ws.merge_range(1, 0, 1, ncols, f"DCF PROJECT — {selected.upper()}   |   Closing", title_fmt)
-        year_labels = [f"Año {i + 1}" for i in range(len(SCOLS))]
-        ws.write(2, 0, "Concepto", hdr_fmt)
-        for c, h in enumerate(year_labels + ["SUBTOTAL"], 1):
-            ws.write(2, c, h, hdr_fmt)
+    st.subheader("Tendencia mensual de ventas")
+    fig = px.line(monthly, x="AnioMesStr", y="Monto_Venta", markers=True)
+    fig.update_traces(line=dict(width=2, color=CATEGORICAL[0]), marker=dict(size=8, color=CATEGORICAL[0]))
+    fig.update_yaxes(title="Ventas Totales ($)")
+    st.plotly_chart(style_fig(fig, show_legend=False), use_container_width=True)
 
-        rn = 3
-
-        def write_sec(title, rows):
-            nonlocal rn
-            ws.merge_range(rn, 0, rn, ncols, title, sub_fmt)
-            rn += 1
-            for label, vals in rows:
-                ws.write(rn, 0, label, lbl_fmt)
-                for c, v in enumerate(vals, 1):
-                    ws.write(rn, c, v, num_fmt)
-                ws.write(rn, len(vals) + 1, sum(vals), tot_fmt)
-                rn += 1
-            rn += 1
-
-        write_sec("INFLOWS",            inflows)
-        write_sec("OUTFLOWS",           outflows)
-        write_sec("FCF FROM FINANCING", financing)
-        write_sec("FREE CASH FLOW", [
-            ("FCF (Sin Financiamiento)", fcf_no_fin),
-            ("FCF (Con Financiamiento)", fcf_with_fin),
-        ])
-
-        ws.merge_range(rn, 0, rn, ncols, "INVESTMENT RETURNS", sub_fmt); rn += 1
-        for label, val, fmt_ in [
-            ("IRR Sin Financiamiento", irr_no  or 0, pct_fmt),
-            ("IRR Con Financiamiento", irr_fin or 0, pct_fmt),
-            ("NPV Sin Financiamiento", npv_no,       tot_fmt),
-            ("NPV Con Financiamiento", npv_fin,      tot_fmt),
-        ]:
-            ws.write(rn, 0, label, lbl_fmt)
-            ws.write(rn, 1, val, fmt_)
-            rn += 1
-
-    buf.seek(0)
-    return buf.read()
-
-def build_pdf():
-    from fpdf import FPDF
-    pdf = FPDF(orientation="L", unit="mm", format="A3")
-    pdf.add_page()
-    pdf.set_margins(10, 10, 10)
-    pdf.set_auto_page_break(True, margin=15)
-
-    BLUE  = (0, 82, 255);  LBLUE = (238, 242, 255)
-    DARK  = (30, 58, 95);  WHITE = (255, 255, 255); TEXT = (38, 39, 48)
-
-    col_w   = max(18, int(360 / (N + 2)))
-    label_w = 50
-    hdrs    = [f"Año {i + 1}" for i in range(len(SCOLS))] + ["SUBTOTAL"]
-
-    ts = datetime.now().strftime("%d/%m/%Y  %H:%M")
-    pdf.set_font("Helvetica", "I", 8); pdf.set_text_color(136, 136, 136)
-    pdf.cell(0, 5, f"Generado: {ts}", ln=True, align="C")
-    pdf.set_font("Helvetica", "B", 16); pdf.set_text_color(*BLUE)
-    pdf.cell(0, 10, _pdf_safe(f"DCF PROJECT - {selected.upper()}  |  Closing"), ln=True, align="C")
-    pdf.set_text_color(*TEXT)
-    pdf.ln(3)
-
-    def draw_header():
-        pdf.set_fill_color(*BLUE); pdf.set_text_color(*WHITE); pdf.set_font("Helvetica", "B", 7)
-        pdf.cell(label_w, 7, "Concepto", border=1, align="C", fill=True)
-        for h in hdrs:
-            pdf.cell(col_w, 7, h, border=1, align="C", fill=True)
-        pdf.ln()
-
-    def draw_sec_title(t):
-        pdf.set_fill_color(*DARK); pdf.set_text_color(*WHITE); pdf.set_font("Helvetica", "B", 8)
-        pdf.cell(label_w + col_w * len(hdrs), 6, f"  {t}", border=1, fill=True, ln=True)
-
-    def fc(v):
-        return "-" if v == 0 else (f"({abs(v):,.0f})" if v < 0 else f"{v:,.0f}")
-
-    def draw_row(label, vals):
-        pdf.set_fill_color(*LBLUE); pdf.set_text_color(*TEXT); pdf.set_font("Helvetica", "", 7)
-        pdf.cell(label_w, 6, _pdf_safe(f"  {label}"), border=1, fill=True)
-        for v in vals:
-            pdf.cell(col_w, 6, fc(v), border=1, align="R")
-        pdf.cell(col_w, 6, fc(sum(vals)), border=1, align="R", fill=True)
-        pdf.ln()
-
-    def draw_fcf(label, vals, sub):
-        pdf.set_fill_color(219, 234, 254); pdf.set_text_color(*TEXT); pdf.set_font("Helvetica", "B", 7)
-        pdf.cell(label_w, 6, _pdf_safe(f"  {label}"), border=1, fill=True)
-        for v in vals:
-            pdf.cell(col_w, 6, fc(v), border=1, align="R")
-        pdf.cell(col_w, 6, fc(sub), border=1, align="R", fill=True)
-        pdf.ln()
-
-    draw_header()
-    draw_sec_title("INFLOWS")
-    for lbl, vals in inflows:  draw_row(lbl, vals)
-    pdf.ln(2)
-    draw_sec_title("OUTFLOWS")
-    for lbl, vals in outflows: draw_row(lbl, vals)
-    pdf.ln(2)
-    draw_sec_title("FCF FROM FINANCING")
-    for lbl, vals in financing: draw_row(lbl, vals)
-    pdf.ln(2)
-    draw_sec_title("FREE CASH FLOW")
-    draw_fcf("FCF (Sin Financiamiento)", fcf_no_fin,   npv_no)
-    draw_fcf("FCF (Con Financiamiento)", fcf_with_fin, npv_fin)
-    pdf.ln(5)
-
-    pdf.set_fill_color(*DARK); pdf.set_text_color(*WHITE); pdf.set_font("Helvetica", "B", 8)
-    pdf.cell(130, 7, "  INVESTMENT RETURNS", border=1, fill=True, ln=True)
-    for lbl, val, is_total in [
-        ("IRR Sin Financiamiento", f"{irr_no*100:.2f}%"  if irr_no  is not None else "-", False),
-        ("IRR Con Financiamiento", f"{irr_fin*100:.2f}%" if irr_fin is not None else "-", False),
-        ("NPV Sin Financiamiento", fmt_usd(npv_no).replace("—", "-"),  True),
-        ("NPV Con Financiamiento", fmt_usd(npv_fin).replace("—", "-"), True),
-    ]:
-        pdf.set_fill_color(*LBLUE); pdf.set_text_color(*TEXT); pdf.set_font("Helvetica", "B", 7)
-        pdf.cell(80, 6, f"  {lbl}", border=1, fill=True)
-        if is_total:
-            pdf.set_fill_color(219, 234, 254); pdf.set_font("Helvetica", "B", 7)
-            pdf.cell(50, 6, val, border=1, align="R", fill=True)
-        else:
-            pdf.set_fill_color(*WHITE); pdf.set_font("Helvetica", "", 7)
-            pdf.cell(50, 6, val, border=1, align="R", fill=True)
-        pdf.ln()
-
-    pdf_bytes = pdf.output(dest="S")
-    if isinstance(pdf_bytes, str):
-        pdf_bytes = pdf_bytes.encode("latin-1")
+    st.subheader("Crecimiento interanual (YoY %)")
+    st.caption("Compara cada mes contra el mismo mes del año anterior, dentro de los filtros activos.")
+    yoy_src = monthly.set_index("Periodo")["Monto_Venta"]
+    yoy_rows = []
+    for period, value in yoy_src.items():
+        prev_period = period - 12
+        if prev_period in yoy_src.index and yoy_src[prev_period] != 0:
+            growth = (value - yoy_src[prev_period]) / yoy_src[prev_period]
+            yoy_rows.append({"AnioMesStr": str(period), "YoY": growth})
+    if yoy_rows:
+        yoy = pd.DataFrame(yoy_rows)
+        colors = np.where(yoy["YoY"] >= 0, GOOD, CRITICAL)
+        fig = go.Figure(go.Bar(x=yoy["AnioMesStr"], y=yoy["YoY"], marker_color=colors))
+        fig.update_yaxes(title="Crecimiento YoY", tickformat=".0%")
+        st.plotly_chart(style_fig(fig, show_legend=False), use_container_width=True)
     else:
-        pdf_bytes = bytes(pdf_bytes)
-    buf = BytesIO(pdf_bytes)
-    buf.seek(0)
-    return buf.read()
+        st.info("No hay suficiente histórico (se necesita el mismo mes del año anterior) para calcular YoY con los filtros actuales.")
 
+# -------------------------------- Presupuesto ---------------------------------
+with tab_presupuesto:
+    st.subheader("Ventas reales vs. presupuesto por región")
+    bp = df.groupby("Region", as_index=False)["Monto_Venta"].sum().rename(columns={"Monto_Venta": "Ventas Reales"})
+    presu_g = presu_filtrado.groupby("Region", as_index=False)["Presupuesto"].sum()
+    comp = pd.DataFrame({"Region": REGION_ORDER}).merge(bp, on="Region", how="left").merge(presu_g, on="Region", how="left").fillna(0)
+    comp["Cumplimiento"] = comp.apply(lambda r: r["Ventas Reales"] / r["Presupuesto"] if r["Presupuesto"] else 0, axis=1)
 
-if fmt_choice == "Excel (.xlsx)":
-    st.download_button(
-        "⬇️ Descargar Excel",
-        build_excel(),
-        file_name=f"DCF_{selected}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-        key=f"dl_excel_{selected}",
+    fig = go.Figure()
+    fig.add_bar(name="Ventas Reales", x=comp["Region"], y=comp["Ventas Reales"], marker_color=CATEGORICAL[0])
+    fig.add_bar(name="Presupuesto", x=comp["Region"], y=comp["Presupuesto"], marker_color=MUTED)
+    fig.update_layout(barmode="group")
+    fig.update_yaxes(title="$")
+    st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    st.dataframe(
+        comp.assign(**{
+            "Ventas Reales": comp["Ventas Reales"].map(lambda v: f"${v:,.0f}"),
+            "Presupuesto": comp["Presupuesto"].map(lambda v: f"${v:,.0f}"),
+            "Cumplimiento": comp["Cumplimiento"].map(lambda v: f"{v:.0%}"),
+        }),
+        hide_index=True,
+        use_container_width=True,
     )
-else:
-    try:
-        pdf_data = build_pdf()
-    except Exception as e:
-        st.error(f"No se pudo generar el PDF: {e}")
-    else:
-        st.download_button(
-            "⬇️ Descargar PDF",
-            pdf_data,
-            file_name=f"DCF_{selected}.pdf",
-            mime="application/pdf",
-            type="primary",
-            key=f"dl_pdf_{selected}",
-        )
+
+# ---------------------------------- Clientes -----------------------------------
+with tab_clientes:
+    st.subheader("Top 10 clientes por ventas")
+    top_clientes = (
+        df.groupby("Cliente", as_index=False)["Monto_Venta"].sum().sort_values("Monto_Venta", ascending=False).head(10)
+    )
+    fig = px.bar(top_clientes.sort_values("Monto_Venta"), x="Monto_Venta", y="Cliente", orientation="h")
+    fig.update_traces(marker_color=CATEGORICAL[0])
+    fig.update_xaxes(title="Ventas Totales ($)")
+    st.plotly_chart(style_fig(fig, show_legend=False, height=420), use_container_width=True)
+
+    st.subheader("Clientes nuevos vs. recurrentes por mes")
+    st.caption("Un cliente es 'nuevo' en el mes de su primera compra registrada (Clientes[Fecha_Primera_Compra]).")
+    df_month = df.assign(AnioMes=df["Fecha"].dt.to_period("M"))
+    primera_compra_periodo = clientes.set_index("ID_Cliente")["Fecha_Primera_Compra"].dt.to_period("M")
+
+    rows = []
+    for periodo, grupo in df_month.groupby("AnioMes"):
+        ids = set(grupo["ID_Cliente"].unique())
+        nuevos = sum(1 for cid in ids if primera_compra_periodo.get(cid) == periodo)
+        rows.append({"AnioMes": str(periodo), "Nuevos": nuevos, "Recurrentes": len(ids) - nuevos})
+    nvr = pd.DataFrame(rows).sort_values("AnioMes")
+
+    fig = go.Figure()
+    fig.add_bar(name="Nuevos", x=nvr["AnioMes"], y=nvr["Nuevos"], marker_color=CATEGORICAL[0])
+    fig.add_bar(name="Recurrentes", x=nvr["AnioMes"], y=nvr["Recurrentes"], marker_color=CATEGORICAL[1])
+    fig.update_layout(barmode="stack")
+    fig.update_yaxes(title="# Clientes")
+    st.plotly_chart(style_fig(fig), use_container_width=True)
+
+# --------------------------------- Productos -----------------------------------
+with tab_productos:
+    st.subheader("Ventas por categoría de producto")
+    cat_orden = sorted(productos["Categoria"].unique())
+    cat_colors = {c: CATEGORICAL[i % len(CATEGORICAL)] for i, c in enumerate(cat_orden)}
+    cat_sales = df.groupby("Categoria", as_index=False)["Monto_Venta"].sum()
+    fig = px.bar(
+        cat_sales, x="Categoria", y="Monto_Venta", color="Categoria",
+        color_discrete_map=cat_colors, category_orders={"Categoria": cat_orden},
+    )
+    fig.update_yaxes(title="Ventas Totales ($)")
+    st.plotly_chart(style_fig(fig, show_legend=False), use_container_width=True)
+
+    st.subheader("Clasificación ABC de productos (Pareto 80/20)")
+    prod_sales = df.groupby("Producto", as_index=False)["Monto_Venta"].sum().sort_values("Monto_Venta", ascending=False)
+    total = prod_sales["Monto_Venta"].sum()
+    prod_sales["% Acumulado"] = prod_sales["Monto_Venta"].cumsum() / total
+    prod_sales["Clase ABC"] = pd.cut(
+        prod_sales["% Acumulado"], bins=[0, 0.8, 0.95, 1.0000001], labels=["A", "B", "C"], include_lowest=True
+    )
+    abc_colors = {"A": GOOD, "B": "#eda100", "C": MUTED}
+
+    def highlight_abc(val):
+        return f"background-color: {abc_colors.get(val, '')}; color: white"
+
+    st.dataframe(
+        prod_sales.assign(**{
+            "Monto_Venta": prod_sales["Monto_Venta"].map(lambda v: f"${v:,.0f}"),
+            "% Acumulado": prod_sales["% Acumulado"].map(lambda v: f"{v:.0%}"),
+        }).style.map(highlight_abc, subset=["Clase ABC"]),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+# -------------------------------- Vendedores -----------------------------------
+with tab_vendedores:
+    st.subheader("Ventas por vendedor y región")
+    vend_region = df.groupby(["Region", "Vendedor"], as_index=False)["Monto_Venta"].sum()
+    fig = px.bar(
+        vend_region, x="Vendedor", y="Monto_Venta", color="Region",
+        color_discrete_map=REGION_COLORS, category_orders={"Region": REGION_ORDER}, barmode="group",
+    )
+    fig.update_yaxes(title="Ventas Totales ($)")
+    st.plotly_chart(style_fig(fig), use_container_width=True)
+
+    st.subheader("Ranking de vendedores dentro de su región")
+    vend_region["Ranking en su Región"] = (
+        vend_region.groupby("Region")["Monto_Venta"].rank(ascending=False, method="dense").astype(int)
+    )
+    vend_region = vend_region.sort_values(["Region", "Ranking en su Región"])
+    st.dataframe(
+        vend_region.assign(Monto_Venta=vend_region["Monto_Venta"].map(lambda v: f"${v:,.0f}")),
+        hide_index=True,
+        use_container_width=True,
+    )
