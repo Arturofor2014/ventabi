@@ -3,7 +3,6 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
 
 st.set_page_config(page_title="Dashboard de Ventas", page_icon="📊", layout="wide")
 
@@ -48,15 +47,28 @@ def style_fig(fig, height=380, show_legend=True):
     return fig
 
 
-conn = st.connection("gsheets", type=GSheetsConnection)
+# El Sheet está compartido como "cualquiera con el enlace puede ver", así que se lee
+# directo por su export CSV público — no requiere cuenta de servicio ni OAuth.
+# El ID vive en secrets (.streamlit/secrets.toml) para no exponerlo en el código.
+if "gsheet_id" not in st.secrets:
+    st.error(
+        "Falta configurar `gsheet_id` en `.streamlit/secrets.toml` "
+        "(ver `.streamlit/secrets.toml.example` y el README)."
+    )
+    st.stop()
+SHEET_ID = st.secrets["gsheet_id"]
+
+
+def _sheet_csv_url(sheet_name: str) -> str:
+    return f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
 
 
 @st.cache_data(ttl=600, show_spinner="Cargando datos desde Google Sheets...")
 def load_data():
-    ventas = conn.read(worksheet="Ventas").dropna(subset=["ID_Venta"])
-    productos = conn.read(worksheet="Productos").dropna(subset=["ID_Producto"])
-    clientes = conn.read(worksheet="Clientes").dropna(subset=["ID_Cliente"])
-    presupuesto = conn.read(worksheet="Presupuesto").dropna(subset=["Region"])
+    ventas = pd.read_csv(_sheet_csv_url("Ventas")).dropna(subset=["ID_Venta"])
+    productos = pd.read_csv(_sheet_csv_url("Productos")).dropna(subset=["ID_Producto"])
+    clientes = pd.read_csv(_sheet_csv_url("Clientes")).dropna(subset=["ID_Cliente"])
+    presupuesto = pd.read_csv(_sheet_csv_url("Presupuesto")).dropna(subset=["Region"])
 
     ventas["Fecha"] = pd.to_datetime(ventas["Fecha"])
     presupuesto["Fecha"] = pd.to_datetime(presupuesto["Fecha"])
@@ -73,8 +85,8 @@ try:
     ventas, productos, clientes, presupuesto = load_data()
 except Exception as e:
     st.error(
-        "No se pudo conectar a Google Sheets. Verifica que `.streamlit/secrets.toml` exista y tenga "
-        "las credenciales de la cuenta de servicio (ver `.streamlit/secrets.toml.example` y el README)."
+        "No se pudo leer el Google Sheet. Verifica que siga compartido como "
+        "'Cualquiera con el enlace puede ver' y que el ID/URL sea correcto."
     )
     st.exception(e)
     st.stop()
